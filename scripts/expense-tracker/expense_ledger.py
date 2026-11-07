@@ -5,9 +5,9 @@
 
 命令分组：
 - 初始化与维护  init / recat
-- 实体与项目    create / link / archive / restore / objects
+- 实体与项目    create / link / relink / archive / restore / objects
 - 预算          budget-set / budget-copy / budget-show
-- 流水          summary / review / transactions / insight / export
+- 流水          summary / cross / review / transactions / insight / export
 - 单笔修正      edit / delete / meta
 """
 from __future__ import annotations
@@ -151,29 +151,11 @@ def create(kind, name, aliases=''):
     return {'name': name, 'status': 'created', 'aliases': _aliases(aliases)}
 
 
-def match(text, table):
-    """Longest unambiguous alias/name match; no silent guessing on ties."""
-    with connect() as con:
-        rows = con.execute(
-            f'SELECT * FROM {table} WHERE ' + ("status='active'" if table == 'projects' else 'active=1')
-        ).fetchall()
-    scored = []
-    for r in rows:
-        terms = [r['name']] + [a for a in json.loads(r['aliases']) if len(a) >= 2]
-        found = [len(t) for t in terms if t and t.lower() in text.lower()]
-        if found:
-            scored.append((max(found), r['id'], r['name']))
-    if not scored:
-        return None
-    best = max(x[0] for x in scored)
-    candidates = [x for x in scored if x[0] == best]
-    return candidates[0] if len(candidates) == 1 else None
-
-
 def match_all(text, table):
     """列出文本里所有明确命中的实体/项目（按出现顺序）。
 
-    规则：最长命中优先；被更长命中覆盖的短命中丢弃（“张三”不会在“张三丰”里再命中）；
+    规则：同一对象在句中出现多次时逐个定位；被更长命中覆盖的那一次出现不计
+    （“张三丰”里的“张三”不算张三），但该对象只要在别处还有一次独立出现就仍然保留；
     同长度且区间重叠的不同对象视为歧义，两个都不返回。
     """
     with connect() as con:
@@ -184,30 +166,37 @@ def match_all(text, table):
     low = text.lower()
     for r in rows:
         terms = [r['name']] + [a for a in json.loads(r['aliases']) if len(a) >= 2]
-        best = None
+        spans = []
         for t in terms:
-            idx = low.find(t.lower())
-            if idx >= 0 and (best is None or len(t) > best[0]):
-                best = (len(t), idx, idx + len(t))
-        if best:
-            hits.append((best[0], best[1], best[2], r['name']))
+            if not t:
+                continue
+            tl = t.lower()
+            idx = low.find(tl)
+            while idx >= 0:
+                spans.append((len(tl), idx, idx + len(tl), r['name']))
+                idx = low.find(tl, idx + 1)
+        if not spans:
+            continue
+        longest = max(s[0] for s in spans)
+        hits.extend(s for s in spans if s[0] == longest)
 
     ambiguous = set()
     for i, a in enumerate(hits):
         for b in hits[i + 1:]:
             if a[3] == b[3]:
                 continue
-            overlap = not (a[2] <= b[1] or b[2] <= a[1])
-            if a[0] == b[0] and overlap:
+            if a[0] == b[0] and not (a[2] <= b[1] or b[2] <= a[1]):
                 ambiguous.update([a[3], b[3]])
-    kept = []
-    for h in hits:
-        if h[3] in ambiguous:
+
+    covered = {i for i, h in enumerate(hits)
+               if any(g[0] > h[0] and g[1] <= h[1] and g[2] >= h[2]
+                      for j, g in enumerate(hits) if j != i)}
+    first_pos = {}
+    for i, h in enumerate(hits):
+        if h[3] in ambiguous or i in covered:
             continue
-        if any(g[0] > h[0] and g[1] <= h[1] and g[2] >= h[2] for g in hits):
-            continue  # 被更长的命中完整覆盖
-        kept.append(h)
-    return [h[3] for h in sorted(kept, key=lambda x: (x[1], -x[0]))]
+        first_pos.setdefault(h[3], h[1])
+    return [n for n, _ in sorted(first_pos.items(), key=lambda x: x[1])]
 
 
 def _resolve(con, table, value):
@@ -235,7 +224,9 @@ def link(tx_id, entity=None, project=None, allocation=None, replace=False):
                 raise ValueError('分摊金额不能超过交易金额')
             con.execute('INSERT INTO transaction_entities(transaction_id,entity_id,allocated_cents) '
                         'VALUES(?,?,?) ON CONFLICT(transaction_id,entity_id) '
-                        'DO UPDATE SET allocated_cents=excluded.allocated_cents', (tx_id, eid, alloc))
+                        'DO UPDATE SET allocated_cents='
+                        'COALESCE(excluded.allocated_cents,transaction_entities.allocated_cents)',
+                        (tx_id, eid, alloc))
             allocated = con.execute(
                 'SELECT COALESCE(SUM(allocated_cents),0) AS total FROM transaction_entities '
                 'WHERE transaction_id=?', (tx_id,)).fetchone()['total']
@@ -247,19 +238,32 @@ def link(tx_id, entity=None, project=None, allocation=None, replace=False):
                         'VALUES(?,?)', (tx_id, pid))
 
 
-def auto_link(tx_id, text, entity=None, project=None):
+def auto_link(tx_id, text, entity=None, project=None, no_link=False):
     """只认显式名称/别名，不做人物推断；一句话里的多个明确实体都会关联。
 
-    多实体不带分摊时按“关联金额”记录（同一笔会在多个实体下各显示全额），
-    报表口径已注明不可相加；需要按人算就用 link --allocation。
+    实体与项目各自独立匹配：句子里只有项目、没有实体时，项目照样写入关联表，
+    不会被实体循环带掉。多实体不带分摊时按“关联金额”记录（同一笔会在多个实体下各显示全额），
+    报表口径已注明不可相加；需要按人算就用 link --allocation。no_link 用于明确不做自动关联。
     """
     init()
+    if no_link:
+        return {'entity': None, 'entities': [], 'project': None, 'projects': [],
+                'multi': False, 'skipped': True}
     names = [entity] if entity else match_all(text, 'entities')
-    p = project or (m[2] if (m := match(text, 'projects')) else None)
+    projects = [project] if project else match_all(text, 'projects')
+    first = projects[0] if projects else None
     for n in names:
-        link(tx_id, n, p)
+        link(tx_id, n, first)
+    if not names:
+        for p in projects:
+            link(tx_id, None, p)
+    else:
+        for p in projects[1:]:
+            link(tx_id, None, p)
     return {'entity': '、'.join(names) if names else None,
-            'entities': names, 'project': p,
+            'entities': names,
+            'project': '、'.join(projects) if projects else None,
+            'projects': projects,
             'multi': len(names) > 1}
 
 
@@ -614,6 +618,147 @@ def summary(start, end, group='category', include_unattributed=False):
     return out
 
 
+def _dim_map(con, dim, start, end):
+    """把交易映射到某个维度下的标签；实体带分摊份额（None 表示全额计入）。"""
+    if dim == 'category':
+        rows = con.execute(
+            "SELECT id, COALESCE(category,'其他') label FROM expenses "
+            "WHERE expense_time>=? AND expense_time<?", (start, end))
+        return {r['id']: [(r['label'], None)] for r in rows}
+    if dim == 'nature':
+        rows = con.execute(
+            "SELECT x.id, COALESCE(m.nature,'ordinary') label FROM expenses x "
+            "LEFT JOIN transaction_meta m ON m.transaction_id=x.id "
+            "WHERE x.expense_time>=? AND x.expense_time<?", (start, end))
+        return {r['id']: [(r['label'], None)] for r in rows}
+    if dim == 'entity':
+        sql = ("SELECT tp.transaction_id tid, e.name label, tp.allocated_cents alloc "
+               "FROM transaction_entities tp JOIN entities e ON e.id=tp.entity_id "
+               "JOIN expenses x ON x.id=tp.transaction_id "
+               "WHERE x.expense_time>=? AND x.expense_time<?")
+    elif dim == 'project':
+        sql = ("SELECT tp.transaction_id tid, p.name label, NULL alloc "
+               "FROM transaction_projects tp JOIN projects p ON p.id=tp.project_id "
+               "JOIN expenses x ON x.id=tp.transaction_id "
+               "WHERE x.expense_time>=? AND x.expense_time<?")
+    else:
+        raise ValueError('rows/cols 仅支持 category/entity/project/nature')
+    out = {}
+    for r in con.execute(sql, (start, end)):
+        out.setdefault(r['tid'], []).append((r['label'], r['alloc']))
+    return out
+
+
+DIM_LABEL = {'category': '分类', 'entity': '实体', 'project': '项目', 'nature': '性质'}
+
+
+def cross(start, end, rows='category', cols='entity'):
+    """二维交叉表（净额）：看“哪一类花在谁/哪个项目上”。
+
+    同一笔若关联多个实体/项目，会在多列各计一次，列合计不可相加；
+    行合计按去重后的交易金额汇总，可直接用于预算对比。
+    """
+    init()
+    if end <= start:
+        raise ValueError('end必须晚于start（不含）')
+    if rows == cols:
+        raise ValueError('rows 与 cols 不能是同一维度')
+    if rows not in DIM_LABEL or cols not in DIM_LABEL:
+        raise ValueError('rows/cols 仅支持 category/entity/project/nature')
+    con = connect()
+    try:
+        base = con.execute(
+            "SELECT x.id,x.amount,x.type,"
+            "COALESCE(m.flow_kind,CASE WHEN x.type='收入' THEN 'income' ELSE 'expense' END) flow "
+            "FROM expenses x LEFT JOIN transaction_meta m ON m.transaction_id=x.id "
+            "WHERE x.expense_time>=? AND x.expense_time<?", (start, end)).fetchall()
+        rmap, cmap = _dim_map(con, rows, start, end), _dim_map(con, cols, start, end)
+    finally:
+        con.close()
+
+    empty = '未归属（可视为自己/其他）'
+    cells, row_total, col_total = {}, {}, {}
+    for e in base:
+        if e['flow'] == 'expense' and e['type'] == '支出':
+            sign = 1
+        elif e['flow'] in ('refund', 'reimbursement'):
+            sign = -1
+        else:
+            continue
+        amount = cents(e['amount'])
+        rs = rmap.get(e['id']) or [(empty, None)]
+        cs = cmap.get(e['id']) or [(empty, None)]
+        for rlab, ralloc in rs:
+            for clab, calloc in cs:
+                if rows == 'entity':
+                    base_amt = ralloc if ralloc is not None else amount
+                elif cols == 'entity':
+                    base_amt = calloc if calloc is not None else amount
+                else:
+                    base_amt = amount
+                cells.setdefault(rlab, {})
+                cells[rlab][clab] = cells[rlab].get(clab, 0) + sign * base_amt
+        # 行合计按交易去重，避免同一笔在多实体/多项目下被重复累加
+        for rlab, _ in rs:
+            row_total[rlab] = row_total.get(rlab, 0) + sign * amount
+        for clab, calloc in cs:
+            if cols == 'entity':
+                col_total[clab] = col_total.get(clab, 0) + sign * (
+                    calloc if calloc is not None else amount)
+            else:
+                col_total[clab] = col_total.get(clab, 0) + sign * amount
+
+    order_r = sorted(cells, key=lambda k: -row_total.get(k, 0))
+    order_c = sorted({c for v in cells.values() for c in v}, key=lambda k: -sum(
+        cells[r].get(k, 0) for r in cells))
+    return {
+        'rows': rows, 'cols': cols,
+        'matrix': [{'row': r,
+                    'cells': {c: fmt(cells[r][c]) for c in order_c if cells[r].get(c)},
+                    'total': fmt(row_total.get(r, 0))} for r in order_r],
+        'col_totals': {c: fmt(col_total.get(c, 0)) for c in order_c},
+        'columns': order_c,
+        'note': '金额为净支出（已扣退款/报销到账）；同一笔关联多个实体或项目时会在多列重复出现，列合计不可相加。',
+    }
+
+
+def relink(start, end, apply=False):
+    """按事项文本重建实体/项目关联，补历史漏关联（默认只预览，--apply 才写）。
+
+    只处理“缺哪一边补哪一边”：已有实体关联的账不会因为这次回填被改动。
+    """
+    init()
+    con = connect()
+    try:
+        rows = con.execute(
+            "SELECT x.id,x.item,x.amount,"
+            "(SELECT COUNT(*) FROM transaction_entities te WHERE te.transaction_id=x.id) ec,"
+            "(SELECT COUNT(*) FROM transaction_projects tp WHERE tp.transaction_id=x.id) pc "
+            "FROM expenses x WHERE x.expense_time>=? AND x.expense_time<? ORDER BY x.id",
+            (start, end)).fetchall()
+    finally:
+        con.close()
+    todo = []
+    for r in rows:
+        if r['ec'] and r['pc']:
+            continue
+        text = r['item'] or ''
+        ents = [] if r['ec'] else match_all(text, 'entities')
+        pros = [] if r['pc'] else match_all(text, 'projects')
+        if ents or pros:
+            todo.append({'id': r['id'], 'item': text, 'amount': fmt(cents(r['amount'])),
+                         'entities': ents, 'projects': pros})
+    if apply:
+        for t in todo:
+            for e in t['entities']:
+                link(t['id'], e, None)
+            for p in t['projects']:
+                link(t['id'], None, p)
+    return {'scanned': len(rows), 'pending': len(todo), 'applied': apply,
+            'items': todo,
+            'note': '默认只预览；确认无误后加 --apply 写入。' if not apply else '已按事项文本回填完成。'}
+
+
 def advisory(period):
     """Deterministic advisory based on observed data; no fabricated causal stories."""
     budgets = budget_status(period)
@@ -896,6 +1041,15 @@ def cli():
     p.add_argument('--end', required=True)
     p.add_argument('--group', choices=['category', 'entity', 'project', 'nature'], default='category')
     p.add_argument('--include-unattributed', action='store_true', help='实体维度附带“未归属”一行')
+    p = sub.add_parser('cross', help='二维交叉表，如 分类×实体')
+    p.add_argument('--start', required=True)
+    p.add_argument('--end', required=True)
+    p.add_argument('--rows', choices=['category', 'entity', 'project', 'nature'], default='category')
+    p.add_argument('--cols', choices=['category', 'entity', 'project', 'nature'], default='entity')
+    p = sub.add_parser('relink', help='按事项文本回填实体/项目关联（默认只预览）')
+    p.add_argument('--start', required=True)
+    p.add_argument('--end', required=True)
+    p.add_argument('--apply', action='store_true', help='确认写入，默认只预览')
     p = sub.add_parser('review')
     p.add_argument('period')
     p = sub.add_parser('archive', help='归档实体/项目（不再参与自动匹配，历史账保留）')
@@ -939,6 +1093,8 @@ def cli():
         elif args.cmd == 'meta':
             set_meta(args.id, args.nature, args.flow, args.detail, args.original)
             out = {'updated': args.id}
+            if args.flow in ('refund', 'reimbursement') and not args.original:
+                out['note'] = '未挂原单：只冲减本期支出；要挂回原单请补 --original <原单ID>'
         elif args.cmd == 'edit':
             out = edit(args.id, args.amount, args.category, args.item, args.date,
                        args.type_, args.remark, args.nature, args.flow)
@@ -953,6 +1109,10 @@ def cli():
             out = budget_status(args.period)
         elif args.cmd == 'summary':
             out = summary(args.start, args.end, args.group, args.include_unattributed)
+        elif args.cmd == 'cross':
+            out = cross(args.start, args.end, args.rows, args.cols)
+        elif args.cmd == 'relink':
+            out = relink(args.start, args.end, args.apply)
         elif args.cmd == 'review':
             out = review(args.period)
         elif args.cmd == 'archive':

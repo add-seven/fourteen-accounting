@@ -1,8 +1,8 @@
 ---
 name: fourteen-accounting
-description: 十四记账，记录和查询个人收支：一句话记账（自动识别金额、日期、分类、实体、项目）、预算执行、周报月报、消费诊断、改错与 CSV 导出。该技能应在用户说“记一笔”“午饭25”“昨天打车16”“十四记账”，或问“这个月花了多少”“预算还剩多少”“出个周报”，或要改错账、查流水、导出账单时使用。金额与统计一律由脚本计算，不用于企业财务或发票报销系统。
+description: 十四记账，记录和查询个人收支：一句话记账（自动识别金额、日期、分类、实体、项目）、预算执行、周报月报、交叉统计、消费诊断、改错与 CSV 导出。该技能应在用户说“记一笔”“午饭25”“昨天打车16”“十四记账”，或问“这个月花了多少”“预算还剩多少”“出个周报”，或要改错账、查流水、导出账单时使用。金额与统计一律由脚本计算，不用于企业财务或发票报销系统。
 agent_created: true
-version: 1.0.0
+version: 1.0.1
 license: MIT
 platforms: [linux, macos, windows]
 ---
@@ -176,6 +176,7 @@ python3 expense_nl.py '买iPhone15 6999'        # 型号数字不会被当金额
 python3 expense_nl.py '自驾车子加油300'         # 自动关联已建实体/项目
 python3 expense_nl.py '酒店400' --project '家庭自驾游'
 python3 expense_nl.py '请张三吃饭260' --entity '张三'
+python3 expense_nl.py '给张三带咖啡38' --no-link   # 句中出现人名，但这笔不是给他的
 ```
 
 - 退出码 `0` 成功；`2` 表示需要确认（未写入）——把解析结果给用户，不要绕过。
@@ -214,6 +215,13 @@ python3 expense_ledger.py objects                          # 看全部实体/项
 python3 expense_ledger.py archive '张三'                    # 归档实体（不再被自动匹配，历史账保留）
 python3 expense_ledger.py archive '家庭自驾游' --kind project
 python3 expense_ledger.py restore '张三'                    # 恢复
+```
+
+历史账里“事项写着项目名、但没有关联记录”的（比如早期版本只记了文字），用 `relink` 按事项文本补回来；默认只预览，确认后加 `--apply`：
+
+```bash
+python3 expense_ledger.py relink --start 2026-01-01 --end 2027-01-01
+python3 expense_ledger.py relink --start 2026-01-01 --end 2027-01-01 --apply
 ```
 
 ## 修正与删除
@@ -263,6 +271,8 @@ python3 expense_ledger.py meta 120 --flow transfer
 python3 expense_ledger.py summary --start 2026-01-01 --end 2027-01-01 --group entity --include-unattributed
 python3 expense_ledger.py summary --start 2026-11-01 --end 2026-12-01 --group project
 python3 expense_ledger.py summary --start 2026-11-01 --end 2026-12-01 --group nature
+python3 expense_ledger.py cross --start 2026-11-01 --end 2026-12-01 --rows category --cols entity
+python3 expense_ledger.py cross --start 2026-11-01 --end 2026-12-01 --rows entity --cols project
 python3 expense_ledger.py review 2026-11
 python3 expense_ledger.py transactions --start 2026-11-01 --end 2026-12-01 --unassigned   # 没归到任何实体的支出
 python3 expense_ledger.py transactions --start 2026-11-01 --end 2026-12-01 --entity '张三'
@@ -281,7 +291,9 @@ python3 expense_report.py --week           # 本周
 - `insight` 是**按需调用**的诊断，不主动推送：环比的基准是上一个自然月（周报里自动改成“环比上周”）；疑似重复=同事项同金额在 `--dup-days` 天内多次出现，**默认 0 天（仅同一天）**，只提示不自动删；小额阈值 `--small` 默认 50 元。要用更宽的窗口查历史重复，显式给 `--dup-days 7`。
 - `export` 输出 UTF-8 BOM 的 CSV，Excel/WPS 直接打开不乱码；实体列多人时用 `、` 分隔。
 - 实体/项目金额是“关联金额”，同一笔可在多视角出现，**不能相加当总账**；总账看 `review` 或报表里的“总支出”。
+- `cross` 是二维表（分类×实体、实体×项目）：**行合计可按交易去重后直接对比预算，列合计在同一笔关联多个对象时会重复，不能相加**。要回答“哪类花在谁身上”“这个项目里两个人各花多少”就用它，不要手工拼两张 `summary`。
 - 月度复盘只基于已存在的数据和预算触发告警，不猜测未来支出。
+- 中文没有词边界：只登记「张三」时，句中的「张三丰」会被算到「张三」。把更长的写法也建成实体即可自动分开，或这一笔用 `--no-link` 记；**不要为了这个在每笔账后追问“到底是哪个张三”**。
 
 ## 定时报告口径（用户偏好）
 

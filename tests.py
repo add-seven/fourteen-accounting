@@ -194,7 +194,7 @@ class EntityTests(Base):
     def test_ambiguous_alias_no_auto_link(self):
         self.ledger.create('person', '张三', '老张')
         self.ledger.create('person', '张四', '老张')
-        self.assertIsNone(self.ledger.match('请老张吃饭', 'entities'))
+        self.assertEqual(self.ledger.match_all('请老张吃饭', 'entities'), [])
 
     def test_unattributed_row_hidden_when_zero(self):
         self.ledger.create('person', '张三')
@@ -217,8 +217,8 @@ class EntityTests(Base):
         self.ledger.create('person', '自己')
         with self.ledger.connect() as con:
             con.execute("UPDATE entities SET aliases=? WHERE name='自己'", ('["我"]',))
-        self.assertIsNone(self.ledger.match('自我提升课程', 'entities'))
-        self.assertEqual(self.ledger.match('自己午饭', 'entities')[2], '自己')
+        self.assertEqual(self.ledger.match_all('自我提升课程', 'entities'), [])
+        self.assertEqual(self.ledger.match_all('自己午饭', 'entities'), ['自己'])
 
 
 class BudgetTests(Base):
@@ -397,16 +397,16 @@ class MultiEntityTests(Base):
 class ArchiveTests(Base):
     def test_archived_entity_not_matched(self):
         self.ledger.create('asset', '我的汽车', '车子')
-        self.assertEqual(self.ledger.match('车子加油', 'entities')[2], '我的汽车')
+        self.assertEqual(self.ledger.match_all('车子加油', 'entities'), ['我的汽车'])
         self.ledger.archive('我的汽车')
-        self.assertIsNone(self.ledger.match('车子加油', 'entities'))
+        self.assertEqual(self.ledger.match_all('车子加油', 'entities'), [])
         self.ledger.archive('我的汽车', restore=True)
-        self.assertEqual(self.ledger.match('车子加油', 'entities')[2], '我的汽车')
+        self.assertEqual(self.ledger.match_all('车子加油', 'entities'), ['我的汽车'])
 
     def test_archived_project_not_matched(self):
         self.ledger.create('project', '家庭自驾游', '自驾')
         self.ledger.archive('家庭自驾游', kind='project')
-        self.assertIsNone(self.ledger.match('露营住宿', 'projects'))
+        self.assertEqual(self.ledger.match_all('露营住宿', 'projects'), [])
         self.assertEqual(self.ledger.objects('project')[0]['status'], 'archived')
 
     def test_archive_keeps_history(self):
@@ -581,6 +581,127 @@ class TemplateTests(Base):
         self.add('100', '衣服', '购物', '2026-11-05')
         self.add('50', '衣服', '购物', '2026-10-28')
         self.assertIn('环比上周', report.week_report('2026-11-05'))
+
+
+class LinkingTests(Base):
+    """关联写入：项目不能因为句中没人物就被丢掉；重复 link 不能清空已设的分摊。"""
+
+    def count(self, table, tx):
+        con = sqlite3.connect(str(self.db))
+        try:
+            return con.execute(f'SELECT COUNT(*) FROM {table} WHERE transaction_id=?',
+                               (tx,)).fetchone()[0]
+        finally:
+            con.close()
+
+    def test_project_linked_without_entity(self):
+        self.ledger.create('project', '家庭自驾游', '自驾')
+        tx = self.add('300', '自驾加油', '交通')
+        out = self.ledger.auto_link(tx, '自驾加油')
+        self.assertIsNone(out['entity'])
+        self.assertEqual(out['project'], '家庭自驾游')
+        self.assertEqual(self.count('transaction_projects', tx), 1)
+        rows = self.ledger.summary('2026-11-01', '2026-12-01', 'project')
+        self.assertEqual(rows[0]['name'], '家庭自驾游')
+        self.assertEqual(rows[0]['amount'], '300.00')
+
+    def test_explicit_project_linked(self):
+        self.ledger.create('project', '家庭自驾游')
+        tx = self.add('400', '酒店', '居住')
+        self.ledger.auto_link(tx, '酒店', None, '家庭自驾游')
+        self.assertEqual(self.count('transaction_projects', tx), 1)
+
+    def test_entity_and_project_both_linked(self):
+        self.ledger.create('asset', '我的汽车', '车子')
+        self.ledger.create('project', '家庭自驾游', '自驾')
+        tx = self.add('300', '自驾车子加油', '交通')
+        self.ledger.auto_link(tx, '自驾车子加油')
+        self.assertEqual(self.count('transaction_entities', tx), 1)
+        self.assertEqual(self.count('transaction_projects', tx), 1)
+
+    def test_project_budget_sees_linked_spend(self):
+        self.ledger.create('project', '家庭自驾游', '自驾')
+        self.ledger.set_budget('2026-11', 'project', 6000, '家庭自驾游')
+        tx = self.add('300', '自驾加油', '交通')
+        self.ledger.auto_link(tx, '自驾加油')
+        spent = {b['name']: b['spent'] for b in self.ledger.budget_status('2026-11')}
+        self.assertEqual(spent['家庭自驾游'], '300.00')
+
+    def test_relink_keeps_allocation(self):
+        self.ledger.create('person', '张三')
+        tx = self.add('500', '聚餐', '餐饮')
+        self.ledger.link(tx, '张三', allocation=50)
+        self.ledger.link(tx, '张三')          # 再链一次（没带分摊）不能把 50 抹成“全额”
+        con = sqlite3.connect(str(self.db))
+        try:
+            alloc = con.execute('SELECT allocated_cents FROM transaction_entities '
+                                'WHERE transaction_id=?', (tx,)).fetchone()[0]
+        finally:
+            con.close()
+        self.assertEqual(alloc, 5000)
+
+    def test_no_link_skips_auto_link(self):
+        self.ledger.create('person', '张三')
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.run_nl('给张三买水5', '--no-link')
+        self.assertIn('¥5', buf.getvalue())
+        con = sqlite3.connect(str(self.db))
+        try:
+            n = con.execute('SELECT COUNT(*) FROM transaction_entities').fetchone()[0]
+        finally:
+            con.close()
+        self.assertEqual(n, 0)
+
+    def test_refund_without_original_is_flagged(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.run_nl('退款200')
+        out = buf.getvalue()
+        self.assertIn('未挂原单', out)
+        self.assertIn('--original', out)
+
+    def test_match_all_keeps_second_occurrence(self):
+        self.ledger.create('person', '张三')
+        self.ledger.create('person', '张三丰')
+        self.assertEqual(self.ledger.match_all('张三丰请张三吃饭', 'entities'), ['张三丰', '张三'])
+
+    def test_relink_preview_then_apply(self):
+        self.ledger.create('project', '家庭自驾游', '自驾')
+        tx = self.add('300', '自驾加油', '交通')
+        preview = self.ledger.relink('2026-11-01', '2026-12-01')
+        self.assertEqual(preview['pending'], 1)
+        self.assertEqual(self.count('transaction_projects', tx), 0)   # 预览不写库
+        self.ledger.relink('2026-11-01', '2026-12-01', apply=True)
+        self.assertEqual(self.count('transaction_projects', tx), 1)
+        self.assertEqual(self.ledger.relink('2026-11-01', '2026-12-01')['pending'], 0)
+
+
+class CrossTests(Base):
+    def test_cross_category_entity(self):
+        self.ledger.create('person', '张三')
+        self.add('25', '午饭', '餐饮')
+        tx = self.add('120', '请张三吃饭', '餐饮')
+        self.ledger.auto_link(tx, '请张三吃饭')
+        out = self.ledger.cross('2026-11-01', '2026-12-01', 'category', 'entity')
+        row = {r['row']: r for r in out['matrix']}['餐饮']
+        self.assertEqual(row['cells']['张三'], '120.00')
+        self.assertEqual(row['cells']['未归属（可视为自己/其他）'], '25.00')
+        self.assertEqual(row['total'], '145.00')
+
+    def test_cross_rejects_same_dimension(self):
+        with self.assertRaises(ValueError):
+            self.ledger.cross('2026-11-01', '2026-12-01', 'entity', 'entity')
+
+    def test_cross_row_total_dedups_multi_entity(self):
+        self.ledger.create('person', '张三')
+        self.ledger.create('person', '李四')
+        tx = self.add('200', '张三李四聚餐', '餐饮')
+        self.ledger.auto_link(tx, '张三李四聚餐')
+        out = self.ledger.cross('2026-11-01', '2026-12-01', 'category', 'entity')
+        row = out['matrix'][0]
+        self.assertEqual(row['total'], '200.00')       # 行合计按交易去重
+        self.assertEqual(out['col_totals']['张三'], '200.00')
 
 
 if __name__ == '__main__':

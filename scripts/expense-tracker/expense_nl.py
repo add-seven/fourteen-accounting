@@ -378,6 +378,8 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--flow", choices=["expense", "income", "transfer", "refund", "reimbursement"],
                     help="资金流性质，非必填；退款/报销到账会自动识别")
     ap.add_argument("--original", type=int, help="退款/报销对应的原交易 ID")
+    ap.add_argument("--no-link", action="store_true",
+                    help="不做自动关联（句中出现人名/项目名但这笔不是给他的时候用）")
     args = ap.parse_args(argv[1:])
 
     text = " ".join(args.text)
@@ -385,6 +387,10 @@ def main(argv: list[str]) -> int:
     text = re.sub(r"(?<=\d),(?=\d{3}(?!\d))", "", text)
     _, _, date_phrase = parse_date(text)
     segments = split_items(text)
+
+    if args.no_link and (args.entity or args.project):
+        print("--no-link 与 --entity/--project 互斥：要么自动关联，要么明确指定。", file=sys.stderr)
+        return 2
 
     if len(segments) > 1 and (args.entity or args.project):
         print(f"一句话包含 {len(segments)} 笔，--entity/--project 会误加到每一笔。"
@@ -433,7 +439,7 @@ def main(argv: list[str]) -> int:
     for p in parsed:
         with redirect_stdout(io.StringIO()):
             record_id = add_expense(p.amount, p.type, p.category, p.item, p.remark, p.expense_time)
-        linked = auto_link(record_id, p.item, args.entity, args.project)
+        linked = auto_link(record_id, p.item, args.entity, args.project, args.no_link)
         if linked["entity"] or linked["project"]:
             p.entity, p.project = linked["entity"], linked["project"]
         flow = args.flow or p.flow
@@ -445,6 +451,9 @@ def main(argv: list[str]) -> int:
             deltas.append((p.category, p.amount))
         ids.append(record_id)
         lines.append(f"✅ 已记账：{_confirm_line(p, record_id)}")
+        if flow in ("refund", "reimbursement") and not args.original:
+            lines.append(f"   ℹ️ 未挂原单：只冲减本期支出，原单统计不变。"
+                         f"要挂回去：meta {record_id} --flow {flow} --original <原单ID>")
         if linked["multi"]:
             lines.append(f"   ℹ️ 同时关联 {len(linked['entities'])} 个实体（全额计入各自名下），"
                          f"要按人分账请用 link --allocation")
