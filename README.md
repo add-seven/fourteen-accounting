@@ -35,7 +35,7 @@ fourteen-accounting/
 
 ## 安装
 
-1. 解开 `fourteen-accounting.zip`，把整个 `fourteen-accounting/` 目录放进 Agent 的 Skill 目录（如 `~/.workbuddy/skills/`）。**目录名要与 frontmatter 的 `name` 一致**，否则加载不到。
+1. 解开下载的安装包 `fourteen-accounting-v<版本号>.zip`（文件名带版本，便于区分新旧），把整个 `fourteen-accounting/` 目录放进 Agent 的 Skill 目录（如 `~/.workbuddy/skills/`）。**目录名要与 frontmatter 的 `name` 一致**，否则加载不到。
 2. 指定账本文件：`export EXPENSE_DB_PATH=/绝对路径/expenses.db`。每次调用都用同一个路径，换路径等于换账本。
 3. 在 `scripts/expense-tracker/` 下运行 `python3 expense_ledger.py init --backup`。
 4. 在 Skill 根目录运行 `python3 tests.py`，87 项应全绿。
