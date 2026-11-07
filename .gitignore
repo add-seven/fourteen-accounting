@@ -1,0 +1,17 @@
+# 账本数据：绝对不能提交（含真实消费记录）
+*.db
+*.db.bak-*
+*.sqlite*
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# 系统
+.DS_Store
+Thumbs.db
+
+# 发布产物（走 Releases，不进源码）
+*.zip
+*.tar.gz
